@@ -4,3 +4,5 @@ requests
 transformers
 torch
 plotly
+pymongo
+dnspython
