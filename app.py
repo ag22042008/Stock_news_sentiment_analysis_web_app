@@ -5,23 +5,29 @@ import time
 from datetime import datetime, timedelta
 from transformers import pipeline
 import plotly.express as px
+import pymongo
 
-# --- 1. PAGE CONFIGURATION ---
 st.set_page_config(page_title="Stock Sentiment Analyzer", page_icon="📈", layout="wide")
 
-# --- 2. LOAD AI MODEL (Cached so it only downloads once) ---
 @st.cache_resource
 def load_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-# --- 3. OUR BACKEND FUNCTIONS ---
-def fetch_stock_news(ticker, start_date, end_date, api_key):
-    """Fetches news day by day to bypass Finnhub limits."""
-    all_news = []
+@st.cache_resource
+def init_mongo():
+    client = pymongo.MongoClient(st.secrets["mongo"]["uri"])
+    return client
+
+try:
+    client = init_mongo()
+    db = client.financial_db
+    news_collection = db.news
+except Exception as e:
+    st.error("Could not connect to MongoDB. Please check your Streamlit secrets!")
+
+def fetch_and_store_news(ticker, start_date, end_date, api_key):
     current_date = start_date
-    
-    # Create a progress bar in the app
-    progress_text = "Fetching daily news..."
+    progress_text = "Fetching and storing news to Database..."
     progress_bar = st.progress(0, text=progress_text)
     total_days = (end_date - start_date).days + 1
     days_processed = 0
@@ -34,17 +40,32 @@ def fetch_stock_news(ticker, start_date, end_date, api_key):
             response = requests.get(url)
             if response.status_code == 200:
                 daily_news = response.json()
-                all_news.extend(daily_news)
+                for article in daily_news:
+                    news_collection.update_one(
+                        {"id": article["id"]}, 
+                        {"$set": article}, 
+                        upsert=True
+                    )
         except Exception as e:
             st.warning(f"Failed to fetch data for {date_str}.")
             
         current_date += timedelta(days=1)
         days_processed += 1
-        progress_bar.progress(days_processed / total_days, text=f"Fetching data for {date_str}...")
-        time.sleep(0.5) # Pause to avoid spamming the API
+        progress_bar.progress(days_processed / total_days, text=f"Syncing data for {date_str} to MongoDB...")
+        time.sleep(0.5) 
         
-    progress_bar.empty() # Remove progress bar when done
-    return all_news
+    progress_bar.empty()
+
+def get_news_from_mongo(ticker, start_date, end_date):
+    start_unix = int(start_date.timestamp())
+    end_unix = int((end_date + timedelta(days=1)).timestamp())
+    
+    query = {
+        "related": ticker,
+        "datetime": {"$gte": start_unix, "$lt": end_unix}
+    }
+    
+    return list(news_collection.find(query, {"_id": 0}))
 
 def clean_news_data(raw_news):
     df = pd.DataFrame(raw_news)
@@ -54,14 +75,9 @@ def clean_news_data(raw_news):
     columns_to_keep = ['datetime', 'related', 'source', 'headline', 'summary']
     df_clean = df[columns_to_keep].copy()
     
-    # Fix datetime
     df_clean['datetime'] = pd.to_datetime(df_clean['datetime'], unit='s')
-    
-    # Combine text
     df_clean['news'] = df_clean['headline'] + ". " + df_clean['summary']
     df_clean = df_clean.drop(columns=['headline', 'summary'])
-    
-    # Sort and reset index
     df_clean = df_clean.sort_values(by='datetime', ascending=False).reset_index(drop=True)
     return df_clean
 
@@ -94,19 +110,17 @@ def calculate_overall_sentiment(df):
     return overall_scores.sort_values(by='overall_sentiment_score', ascending=False)
 
 def plot_sentiment(df_overall):
-    # Create an interactive, sleek Plotly chart
     fig = px.bar(
         df_overall, 
         x='related', 
         y='overall_sentiment_score', 
         color='overall_sentiment_score',
-        color_continuous_scale=['#ff4b4b', '#f9f9f9', '#09ab3b'], # Red to Green
+        color_continuous_scale=['#ff4b4b', '#f9f9f9', '#09ab3b'], 
         range_color=[-1, 1],
         text_auto='.2f',
         labels={'overall_sentiment_score': 'Sentiment Score', 'related': 'Company Ticker'}
     )
     
-    # Style the background and grid lines
     fig.update_layout(
         title=dict(text='Overall News Sentiment by Company', font=dict(size=18, color='white')),
         xaxis=dict(showgrid=False, title=''),
@@ -119,92 +133,44 @@ def plot_sentiment(df_overall):
     st.plotly_chart(fig, use_container_width=True)
 
 def style_dataframe(df):
-    """Highlights the sentiment labels with colors in the raw data table."""
     def highlight_sentiment(val):
         if val == 'positive': return 'color: #09ab3b; font-weight: bold;'
         elif val == 'negative': return 'color: #ff4b4b; font-weight: bold;'
         return 'color: gray;'
     return df.style.map(highlight_sentiment, subset=['sentiment_label'])
 
-# --- 4. STREAMLIT USER INTERFACE ---
 st.title("📊 ML Financial News Sentiment Analyzer")
 st.markdown("""
     <div style='background-color: #1e1e2e; padding: 15px; border-radius: 10px; border-left: 5px solid #4facfe; margin-bottom: 20px;'>
         <h4 style='margin:0; color: white;'>Uncover Market Sentiment in Seconds 🚀</h4>
-        <p style='margin:0; color: #a6accd;'>This tool fetches live stock news from Finnhub, analyzes the text using the <b>FinBERT AI model</b>, and calculates a weighted mathematical sentiment score for the company.</p>
+        <p style='margin:0; color: #a6accd;'>Powered by <b>FinBERT AI</b> and <b>MongoDB</b> to analyze and store historical market sentiment.</p>
     </div>
 """, unsafe_allow_html=True)
 
-# Sidebar for User Inputs
 st.sidebar.header("⚙️ Configuration")
-api_key_input = st.sidebar.text_input("Finnhub API Key", type="password", help="Get a free key from finnhub.io")
-ticker_input = st.sidebar.text_input("Stock Ticker (e.g., AAPL, MSFT)", "AAPL").upper()
+api_key_input = st.sidebar.text_input("🔑 Finnhub API Key", type="password", help="Get a free key from finnhub.io")
+ticker_input = st.sidebar.text_input("📈 Stock Ticker (e.g., AAPL, MSFT)", "AAPL").upper()
 
-# Date Picker
 today = datetime.now()
 seven_days_ago = today - timedelta(days=7)
-start_date = st.sidebar.date_input(" Start Date", seven_days_ago)
-end_date = st.sidebar.date_input(" End Date", today)
+start_date = st.sidebar.date_input("📅 Start Date", seven_days_ago)
+end_date = st.sidebar.date_input("📅 End Date", today)
 
 st.sidebar.divider()
 analyze_button = st.sidebar.button("🚀 Analyze Sentiment", use_container_width=True, type="primary")
 
-# --- 5. MAIN APP LOGIC ---
 if analyze_button:
     if not api_key_input:
-        st.error(" Please enter your Finnhub API Key in the sidebar.")
+        st.error("⚠️ Please enter your Finnhub API Key in the sidebar.")
     elif start_date > end_date:
-        st.error(" Start Date cannot be after End Date.")
+        st.error("⚠️ Start Date cannot be after End Date.")
     else:
-        # Step 1: Load Model
-        with st.spinner(" Loading FinBERT AI Model..."):
+        with st.spinner("🤖 Loading FinBERT AI Model..."):
             analyzer = load_model()
             
-        # Step 2: Fetch Data
-        raw_news = fetch_stock_news(ticker_input, start_date, end_date, api_key_input)
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        end_datetime = datetime.combine(end_date, datetime.min.time())
         
-        if not raw_news:
-            st.warning(f" No news found for {ticker_input} in that date range.")
-        else:
-            # Step 3: Clean Data
-            with st.spinner(" Cleaning and organizing data..."):
-                df_clean = clean_news_data(raw_news)
-                
-            # Step 4: Analyze Sentiment
-            with st.spinner(" AI is reading and scoring the articles..."):
-                df_scored = analyze_sentiment(df_clean, analyzer)
-                df_overall = calculate_overall_sentiment(df_scored)
-                
-            # Step 5: Display Results!
-            st.success(" Analysis Complete!")
-            st.divider()
-            
-            st.subheader(f" Overall Sentiment for {ticker_input}")
-            
-            # Display metrics with interactive deltas
-            col1, col2, col3 = st.columns(3)
-            score = round(df_overall['overall_sentiment_score'].iloc[0], 2)
-            majority = df_overall['majority_sentiment'].iloc[0].title()
-            
-            with col1:
-                st.metric("Total Articles Analyzed", df_overall['total_articles'].iloc[0], delta="Relevant News")
-            with col2:
-                delta_color = "normal" if majority == "Positive" else "inverse" if majority == "Negative" else "off"
-                st.metric("Majority Sentiment", majority, delta="AI Consensus", delta_color=delta_color)
-            with col3:
-                st.metric("Average Score (-1 to 1)", score, delta=f"{abs(score * 100):.0f}% Intensity", delta_color="normal" if score > 0 else "inverse" if score < 0 else "off")
-                
-            st.divider()
-            
-            # Use Tabs for better organization
-            tab1, tab2 = st.tabs([" Data Visualization", " Detailed Article Breakdown"])
-            
-            with tab1:
-                plot_sentiment(df_overall)
-                st.info(" **How to read this chart:** Scores above 0 indicate positive sentiment, while scores below 0 indicate negative sentiment. The closer to 1 or -1, the stronger the AI's confidence.")
-                
-            with tab2:
-                st.markdown("### Raw AI Scoring Data")
-                # Display the styled DataFrame
-                styled_df = style_dataframe(df_scored[['datetime', 'news', 'sentiment_label', 'confidence', 'numeric_score']])
-                st.dataframe(styled_df, use_container_width=True, height=400)
+        fetch_and_store_news(ticker_input, start_datetime, end_datetime, api_key_input)
+        
+        raw_news = get_
