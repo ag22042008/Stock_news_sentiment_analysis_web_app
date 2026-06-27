@@ -173,4 +173,4 @@ if analyze_button:
         
         fetch_and_store_news(ticker_input, start_datetime, end_datetime, api_key_input)
         
-        raw_news = get_
+        raw_news = get_news_from_mongo(ticker_input, start_datetime, end_datetime)
