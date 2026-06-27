@@ -104,7 +104,7 @@ if analyze_button and api_key:
                         'steps': [
                             {'range': [-1, -0.2], 'color': "red"},
                             {'range': [-0.2, 0.2], 'color': "gray"},
-                            {'range': [0.2, 1], 'color': "green'"}
+                            {'range': [0.2, 1], 'color': "green"}
                         ]
                     }
                 ))
