@@ -5,10 +5,11 @@ import pandas as pd
 from transformers import pipeline
 import datetime
 import time
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Multi-Stock Sentiment Analyzer", page_icon="📊", layout="wide")
 
-st.title("📊 Multi-Company Sentiment Dashboard")
+st.title("📊 Multi-Company Strategic Sentiment Dashboard")
 
 @st.cache_resource
 def init_mongodb():
@@ -30,8 +31,8 @@ def fetch_and_store_news(tickers, start_date, end_date, api_key):
     finnhub_client = finnhub.Client(api_key=api_key)
     delta = end_date - start_date
     total_days = delta.days + 1
-    
     progress_bar = st.progress(0)
+    
     for i, ticker in enumerate(tickers):
         for d in range(total_days):
             date_str = (start_date + datetime.timedelta(days=d)).strftime("%Y-%m-%d")
@@ -59,9 +60,13 @@ def process_sentiment(df):
     results = sentiment_pipeline(df["headline"].tolist())
     df["sentiment_label"] = [res["label"] for res in results]
     df["sentiment_score"] = [res["score"] for res in results]
+    
+    label_map = {"positive": 1, "negative": -1, "neutral": 0}
+    df["numeric_sentiment"] = df["sentiment_label"].map(label_map)
     return df
 
 with st.sidebar:
+    st.header("⚙️ Configuration")
     api_key = st.text_input("Finnhub API Key", type="password")
     tickers = st.multiselect("Select Companies", ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "NVDA"], default=["AAPL", "MSFT"])
     start_date = st.date_input("Start Date", datetime.date.today() - datetime.timedelta(days=7))
@@ -74,13 +79,38 @@ if analyze_button and api_key:
     
     if raw_news:
         df = process_sentiment(pd.DataFrame(raw_news))
-        st.subheader("Comparative Sentiment Analysis")
         
-        # Aggregate stats
-        agg_df = df.groupby(["ticker", "sentiment_label"]).size().unstack(fill_value=0)
-        st.bar_chart(agg_df)
+        company_stats = df.groupby("ticker").agg(
+            overall_sentiment_score=("numeric_sentiment", "mean"),
+            majority_sentiment=("sentiment_label", lambda x: x.mode()[0])
+        ).reset_index()
+
+        st.subheader("📈 Comparative Company Analysis")
+        st.dataframe(company_stats, use_container_width=True)
         
-        # Detailed table
+        st.subheader("📊 Sentiment Distribution & Scoring")
+        col_charts = st.columns(len(company_stats))
+        
+        for idx, row in company_stats.iterrows():
+            with col_charts[idx]:
+                fig = go.Figure(go.Indicator(
+                    mode = "gauge+number",
+                    value = row['overall_sentiment_score'],
+                    domain = {'x': [0, 1], 'y': [0, 1]},
+                    title = {'text': row['ticker']},
+                    gauge = {
+                        'axis': {'range': [-1, 1]},
+                        'bar': {'color': "darkblue"},
+                        'steps': [
+                            {'range': [-1, -0.2], 'color': "red"},
+                            {'range': [-0.2, 0.2], 'color': "gray"},
+                            {'range': [0.2, 1], 'color': "green'"}
+                        ]
+                    }
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+        
+        st.subheader("📋 Detailed Article Breakdown")
         st.dataframe(df[["ticker", "headline", "sentiment_label", "sentiment_score"]], use_container_width=True)
     else:
         st.warning("No data found for selected companies.")
