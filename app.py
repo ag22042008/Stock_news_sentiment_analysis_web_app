@@ -1,176 +1,163 @@
 import streamlit as st
-import pandas as pd
-import requests
-import time
-from datetime import datetime, timedelta
-from transformers import pipeline
-import plotly.express as px
 import pymongo
+import finnhub
+import pandas as pd
+from transformers import pipeline
+import datetime
+import time
 
-st.set_page_config(page_title="Stock Sentiment Analyzer", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Stock News Sentiment Analyzer", page_icon="📊", layout="wide")
+
+st.title("📊 Strategic Stock News Sentiment Analyzer")
+st.markdown("Fetch real-time financial market news, preserve history in MongoDB, and evaluate market sentiment with FinBERT.")
 
 @st.cache_resource
-def load_model():
+def init_mongodb():
+    try:
+        mongo_uri = st.secrets["mongo"]["uri"]
+        client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        db = client["stock_analysis_db"]
+        collection = db["news_articles"]
+        return collection
+    except Exception as e:
+        st.error(f"Could not connect to MongoDB. Please check your Streamlit secrets! Error: {e}")
+        return None
+
+@st.cache_resource
+def load_sentiment_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
-@st.cache_resource
-def init_mongo():
-    client = pymongo.MongoClient(st.secrets["mongo"]["uri"])
-    return client
-
-try:
-    client = init_mongo()
-    db = client.financial_db
-    news_collection = db.news
-except Exception as e:
-    st.error("Could not connect to MongoDB. Please check your Streamlit secrets!")
+news_collection = init_mongodb()
+sentiment_pipeline = load_sentiment_model()
 
 def fetch_and_store_news(ticker, start_date, end_date, api_key):
-    current_date = start_date
-    progress_text = "Fetching and storing news to Database..."
-    progress_bar = st.progress(0, text=progress_text)
-    total_days = (end_date - start_date).days + 1
-    days_processed = 0
+    if news_collection is None:
+        st.error("MongoDB connection is unavailable. Cannot store records.")
+        return
+
+    finnhub_client = finnhub.Client(api_key=api_key)
     
-    while current_date <= end_date:
-        date_str = current_date.strftime('%Y-%m-%d')
-        url = f'https://finnhub.io/api/v1/company-news?symbol={ticker}&from={date_str}&to={date_str}&token={api_key}'
+    delta = end_date - start_date
+    total_days = delta.days + 1
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    saved_count = 0
+
+    for i in range(total_days):
+        current_day = start_date + datetime.timedelta(days=i)
+        date_str = current_day.strftime("%Y-%m-%d")
+        
+        status_text.text(f"Fetching data from Finnhub for {date_str}...")
         
         try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                daily_news = response.json()
-                for article in daily_news:
-                    news_collection.update_one(
-                        {"id": article["id"]}, 
-                        {"$set": article}, 
-                        upsert=True
-                    )
-        except Exception as e:
-            st.warning(f"Failed to fetch data for {date_str}.")
+            news_list = finnhub_client.company_news(ticker, _from=date_str, to=date_str)
             
-        current_date += timedelta(days=1)
-        days_processed += 1
-        progress_bar.progress(days_processed / total_days, text=f"Syncing data for {date_str} to MongoDB...")
-        time.sleep(0.5) 
+            day_saved = 0
+            for item in news_list:
+                unique_id = f"{ticker}_{item.get('id')}"
+                
+                document = {
+                    "_id": unique_id,
+                    "ticker": ticker.upper(),
+                    "headline": item.get("headline", ""),
+                    "summary": item.get("summary", ""),
+                    "source": item.get("source", ""),
+                    "url": item.get("url", ""),
+                    "datetime": datetime.datetime.fromtimestamp(item.get("datetime", time.time())),
+                    "date_string": date_str
+                }
+                
+                news_collection.update_one({"_id": unique_id}, {"$set": document}, upsert=True)
+                day_saved += 1
+            
+            saved_count += day_saved
+            
+        except Exception as e:
+            st.warning(f"Failed to process records for {date_str}. Error details: {str(e)}")
         
+        progress_bar.progress((i + 1) / total_days)
+        time.sleep(1.1)
+        
+    status_text.empty()
     progress_bar.empty()
+    st.success(f"Successfully processed and synchronized {saved_count} articles into MongoDB!")
 
 def get_news_from_mongo(ticker, start_date, end_date):
-    start_unix = int(start_date.timestamp())
-    end_unix = int((end_date + timedelta(days=1)).timestamp())
+    if news_collection is None:
+        return []
+        
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
     
     query = {
-        "related": ticker,
-        "datetime": {"$gte": start_unix, "$lt": end_unix}
+        "ticker": ticker.upper(),
+        "date_string": {"$gte": start_str, "$lte": end_str}
     }
     
     return list(news_collection.find(query, {"_id": 0}))
 
-def clean_news_data(raw_news):
-    df = pd.DataFrame(raw_news)
-    if df.empty:
-        return df
+def process_sentiment(df):
+    with st.spinner("Analyzing headline dynamics using FinBERT..."):
+        headlines = df["headline"].tolist()
+        results = sentiment_pipeline(headlines)
         
-    columns_to_keep = ['datetime', 'related', 'source', 'headline', 'summary']
-    df_clean = df[columns_to_keep].copy()
-    
-    df_clean['datetime'] = pd.to_datetime(df_clean['datetime'], unit='s')
-    df_clean['news'] = df_clean['headline'] + ". " + df_clean['summary']
-    df_clean = df_clean.drop(columns=['headline', 'summary'])
-    df_clean = df_clean.sort_values(by='datetime', ascending=False).reset_index(drop=True)
-    return df_clean
-
-def analyze_sentiment(df, sentiment_analyzer):
-    def get_sentiment_score(text):
-        try:
-            result = sentiment_analyzer(text, truncation=True, max_length=512)[0]
-            label = result['label']
-            confidence = result['score']
-            
-            if label == 'positive': multiplier = 1
-            elif label == 'negative': multiplier = -1
-            else: multiplier = 0
-                
-            numeric_score = multiplier * confidence
-            return pd.Series([label, confidence, numeric_score])
-        except:
-            return pd.Series(["neutral", 0.0, 0.0])
-
-    df[['sentiment_label', 'confidence', 'numeric_score']] = df['news'].apply(get_sentiment_score)
+        labels = [res["label"] for res in results]
+        scores = [res["score"] for res in results]
+        
+        df["sentiment_label"] = labels
+        df["sentiment_score"] = scores
     return df
 
-def calculate_overall_sentiment(df):
-    overall_scores = df.groupby('related').agg(
-        overall_sentiment_score=('numeric_score', 'mean'), 
-        total_articles=('numeric_score', 'count'),
-        majority_sentiment=('sentiment_label', lambda x: x.mode()[0] if not x.mode().empty else "neutral")
-    ).reset_index()
+with st.sidebar:
+    st.header("⚙️ Configuration Settings")
+    finnhub_api_key = st.text_input("Finnhub API Key", type="password")
+    st.markdown("---")
+    ticker_input = st.text_input("Stock Ticker Symbol", value="AAPL").upper().strip()
     
-    return overall_scores.sort_values(by='overall_sentiment_score', ascending=False)
-
-def plot_sentiment(df_overall):
-    fig = px.bar(
-        df_overall, 
-        x='related', 
-        y='overall_sentiment_score', 
-        color='overall_sentiment_score',
-        color_continuous_scale=['#ff4b4b', '#f9f9f9', '#09ab3b'], 
-        range_color=[-1, 1],
-        text_auto='.2f',
-        labels={'overall_sentiment_score': 'Sentiment Score', 'related': 'Company Ticker'}
-    )
+    default_start = datetime.date.today() - datetime.timedelta(days=7)
+    default_end = datetime.date.today()
     
-    fig.update_layout(
-        title=dict(text='Overall News Sentiment by Company', font=dict(size=18, color='white')),
-        xaxis=dict(showgrid=False, title=''),
-        yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.1)', zeroline=True, zerolinecolor='gray', zerolinewidth=2),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        margin=dict(l=20, r=20, t=50, b=20)
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-
-def style_dataframe(df):
-    def highlight_sentiment(val):
-        if val == 'positive': return 'color: #09ab3b; font-weight: bold;'
-        elif val == 'negative': return 'color: #ff4b4b; font-weight: bold;'
-        return 'color: gray;'
-    return df.style.map(highlight_sentiment, subset=['sentiment_label'])
-
-st.title("📊 ML Financial News Sentiment Analyzer")
-st.markdown("""
-    <div style='background-color: #1e1e2e; padding: 15px; border-radius: 10px; border-left: 5px solid #4facfe; margin-bottom: 20px;'>
-        <h4 style='margin:0; color: white;'>Uncover Market Sentiment in Seconds 🚀</h4>
-        <p style='margin:0; color: #a6accd;'>Powered by <b>FinBERT AI</b> and <b>MongoDB</b> to analyze and store historical market sentiment.</p>
-    </div>
-""", unsafe_allow_html=True)
-
-st.sidebar.header("⚙️ Configuration")
-api_key_input = st.sidebar.text_input("🔑 Finnhub API Key", type="password", help="Get a free key from finnhub.io")
-ticker_input = st.sidebar.text_input("📈 Stock Ticker (e.g., AAPL, MSFT)", "AAPL").upper()
-
-today = datetime.now()
-seven_days_ago = today - timedelta(days=7)
-start_date = st.sidebar.date_input("📅 Start Date", seven_days_ago)
-end_date = st.sidebar.date_input("📅 End Date", today)
-
-st.sidebar.divider()
-analyze_button = st.sidebar.button("🚀 Analyze Sentiment", use_container_width=True, type="primary")
+    start_date_input = st.date_input("Start Date", value=default_start)
+    end_date_input = st.date_input("End Date", value=default_end)
+    analyze_button = st.button("🚀 Run Complete Pipeline", use_container_width=True)
 
 if analyze_button:
-    if not api_key_input:
-        st.error("⚠️ Please enter your Finnhub API Key in the sidebar.")
-    elif start_date > end_date:
-        st.error("⚠️ Start Date cannot be after End Date.")
+    if not finnhub_api_key:
+        st.error("Please enter your Finnhub API Key in the sidebar configuration section.")
+    elif start_date_input > end_date_input:
+        st.error("Configuration Error: Start Date cannot fall after the specified End Date.")
     else:
-        with st.spinner("🤖 Loading FinBERT AI Model..."):
-            analyzer = load_model()
+        st.info(f"Step 1: Contacting Finnhub to fetch and sync data for **{ticker_input}**...")
+        fetch_and_store_news(ticker_input, start_date_input, end_date_input, finnhub_api_key)
+        
+        st.info("Step 2: Retrieving compiled dataset from your MongoDB Atlas Cluster...")
+        raw_news = get_news_from_mongo(ticker_input, start_date_input, end_date_input)
+        
+        if not raw_news:
+            st.warning(f"No matching news items found inside the database for {ticker_input} within the selected timeframe.")
+        else:
+            df_news = pd.DataFrame(raw_news)
+            st.success(f"Step 3: Found {len(df_news)} compiled historical records. Running FinBERT model...")
             
-        start_datetime = datetime.combine(start_date, datetime.min.time())
-        end_datetime = datetime.combine(end_date, datetime.min.time())
-        
-        fetch_and_store_news(ticker_input, start_datetime, end_datetime, api_key_input)
-        
-        raw_news = get_news_from_mongo(ticker_input, start_datetime, end_datetime)
+            df_processed = process_sentiment(df_news)
+            
+            st.markdown("---")
+            st.subheader(f"📊 Market Sentiment Dashboard for {ticker_input}")
+            
+            col1, col2, col3 = st.columns(3)
+            counts = df_processed["sentiment_label"].value_counts()
+            
+            col1.metric("Positive Articles", counts.get("positive", 0))
+            col2.metric("Neutral Articles", counts.get("neutral", 0))
+            col3.metric("Negative Articles", counts.get("negative", 0))
+            
+            st.markdown("### 📈 Sentiment Distribution Breakdown")
+            st.bar_chart(counts)
+            
+            st.markdown("### 📋 Document Source Records & Analysis Insights")
+            st.dataframe(
+                df_processed[["datetime", "source", "headline", "sentiment_label", "sentiment_score"]],
+                use_container_width=True
+            )
