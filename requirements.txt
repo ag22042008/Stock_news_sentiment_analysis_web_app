@@ -6,3 +6,4 @@ torch
 plotly
 pymongo
 dnspython
+finnhub
